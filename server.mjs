@@ -19,6 +19,12 @@ const PORT = parseInt(process.env.ZEN_DEBUG_PORT || '9222');
 const WS_URL = `ws://127.0.0.1:${PORT}/session`;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_BASE_DELAY = 1000; // ms
+// Zen allows one BiDi session at a time, shared by every Claude session's zen-mcp: release it when idle so others can
+// take a turn, and wait a while for a busy Zen instead of failing at once
+const IDLE_MS = parseInt(process.env.ZEN_IDLE_MS || '30000');
+const BUSY_WAIT_MS = parseInt(process.env.ZEN_BUSY_WAIT_MS || '20000');
+const BUSY_POLL_MS = 500;
+const isBusy = (e) => /session not created|Maximum number of active sessions/.test(e?.message || '');
 
 function log(...args) { console.error('[zen-mcp]', ...args); }
 
@@ -30,8 +36,6 @@ class BiDiClient {
   msgId = 0;
   pending = new Map(); // id -> { resolve, reject, timer }
   currentContext = null; // active browsing context
-  _intentionalDisconnect = false; // prevents auto-reconnect during shutdown
-  _reconnecting = false; // guards against concurrent reconnect attempts
   _connectPromise = null; // deduplicates concurrent connect() calls
 
   /**
@@ -71,26 +75,11 @@ class BiDiClient {
           await this._createSession();
           resolve();
         } catch (e) {
-          // Handle zombie session: Zen thinks a session exists but it's dead
-          if (e.message?.includes('Maximum number of active sessions')) {
-            log('Zombie session detected — a previous client left an orphaned session.');
-            try {
-              await this._endZombieSession();
-              await this._createSession();
-              log('Zombie recovery succeeded — new session created');
-              resolve();
-            } catch (retryErr) {
-              reject(new Error(
-                `Zen Browser has a zombie session that cannot be cleared remotely.\n` +
-                `This happens when a previous client disconnected without ending its session.\n\n` +
-                `Fix: Restart Zen Browser:\n` +
-                `  killall zen && /Applications/Zen.app/Contents/MacOS/zen --remote-debugging-port ${PORT}\n\n` +
-                `Technical detail: ${retryErr.message}`
-              ));
-            }
-          } else {
-            reject(e);
+          // another zen-mcp holds Zen's one session: drop our socket so we hold nothing while we wait
+          if (isBusy(e)) {
+            try { ws.close(); } catch {}
           }
+          reject(e);
         }
       });
 
@@ -111,53 +100,11 @@ class BiDiClient {
     log('Session created:', this.sessionId);
 
     const tree = await this.send('browsingContext.getTree', {});
-    if (tree.contexts?.length > 0) {
+    const kept = tree.contexts?.some((c) => c.context === this.currentContext);
+    if (!kept && tree.contexts?.length > 0) {
       this.currentContext = tree.contexts[0].context;
       log('Active context:', this.currentContext);
     }
-  }
-
-  /**
-   * Handle a zombie session left by a previous client that disconnected uncleanly.
-   *
-   * KNOWN LIMITATION: Zen Browser's session.end is connection-scoped — you cannot
-   * end a session created by a different WebSocket connection. The only reliable
-   * way to clear zombie sessions is to restart Zen Browser.
-   *
-   * Strategy: Close and reopen the WebSocket, then attempt session.new again.
-   * Sometimes Zen cleans up sessions when all WebSocket connections close.
-   * If it still fails, throw an actionable error.
-   */
-  async _endZombieSession() {
-    log('Attempting zombie session recovery...');
-    log('Note: Zen session.end is connection-scoped; cannot end another WS session.');
-
-    // Close our current WebSocket — this may trigger Zen to clean up
-    try { this.ws.close(); } catch {}
-    this.ws = null;
-    this.sessionId = null;
-    this.pending.clear();
-
-    // Brief pause to let Zen process the disconnect
-    await new Promise(r => setTimeout(r, 500));
-
-    // Open a fresh WebSocket and try session.new again
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(WS_URL);
-      ws.on('open', () => {
-        this.ws = ws;
-        this._setupListeners(ws);
-        log('Fresh WebSocket opened for zombie recovery');
-        resolve();
-      });
-      ws.on('error', (e) => {
-        reject(new Error(
-          `Zombie session recovery failed: cannot reconnect to Zen.\n` +
-          `Restart Zen Browser to clear stale sessions:\n` +
-          `  killall zen && /Applications/Zen.app/Contents/MacOS/zen --remote-debugging-port ${PORT}`
-        ));
-      });
-    });
   }
 
   /** Attach message/close listeners to a WebSocket */
@@ -174,7 +121,7 @@ class BiDiClient {
           clearTimeout(timer);
           this.pending.delete(msg.id);
           if (msg.type === 'error') {
-            reject(new Error(msg.error?.message || JSON.stringify(msg.error)));
+            reject(new Error([msg.error, msg.message].filter(Boolean).join(': ') || JSON.stringify(msg)));
           } else {
             resolve(msg.result);
           }
@@ -196,36 +143,7 @@ class BiDiClient {
       }
       this.pending.clear();
 
-      // Auto-reconnect unless we're shutting down intentionally
-      if (!this._intentionalDisconnect) {
-        this._scheduleReconnect();
-      }
     });
-  }
-
-  /** Schedule a reconnect attempt with exponential backoff */
-  _scheduleReconnect(attempt = 1) {
-    if (this._reconnecting || this._intentionalDisconnect) return;
-    if (attempt > MAX_RECONNECT_ATTEMPTS) {
-      log(`Reconnect failed after ${MAX_RECONNECT_ATTEMPTS} attempts. Use a tool to retry.`);
-      return;
-    }
-
-    this._reconnecting = true;
-    const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt - 1);
-    log(`Reconnecting in ${delay}ms (attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS})...`);
-
-    setTimeout(async () => {
-      try {
-        await this.connect();
-        log('Reconnected successfully');
-        this._reconnecting = false;
-      } catch (e) {
-        log(`Reconnect attempt ${attempt} failed:`, e.message);
-        this._reconnecting = false;
-        this._scheduleReconnect(attempt + 1);
-      }
-    }, delay);
   }
 
   send(method, params = {}, timeout = 30000) {
@@ -252,12 +170,23 @@ class BiDiClient {
     if (this.ws?.readyState === WebSocket.OPEN && this.sessionId) return;
 
     let lastErr;
+    const busyUntil = Date.now() + BUSY_WAIT_MS;
     for (let i = 1; i <= MAX_RECONNECT_ATTEMPTS; i++) {
       try {
         await this.connect();
         return;
       } catch (e) {
         lastErr = e;
+        if (isBusy(e)) {
+          if (Date.now() >= busyUntil)
+            throw new Error(
+              `Zen is in use by another session (its zen-mcp holds Zen's only BiDi session) after waiting ${BUSY_WAIT_MS}ms; try again shortly. ` +
+              `If nothing else uses Zen, restart it: killall zen && /Applications/Zen.app/Contents/MacOS/zen --remote-debugging-port ${PORT}`
+            );
+          i--; // waiting for a busy Zen is not a failed attempt
+          await new Promise(r => setTimeout(r, BUSY_POLL_MS));
+          continue;
+        }
         if (i < MAX_RECONNECT_ATTEMPTS) {
           const delay = RECONNECT_BASE_DELAY * Math.pow(2, i - 1);
           log(`Connection attempt ${i} failed: ${e.message}. Retrying in ${delay}ms...`);
@@ -357,7 +286,6 @@ class BiDiClient {
   }
 
   async disconnect() {
-    this._intentionalDisconnect = true;
     await this.endSession();
     if (this.ws) {
       try { this.ws.close(); } catch {}
@@ -1019,7 +947,6 @@ async function handleTool(name, args) {
     case 'zen_reconnect': {
       log('Forcing reconnect...');
       try { await bidi.disconnect(); } catch {}
-      bidi._intentionalDisconnect = false; // Reset so connect() works
       await bidi.connect();
       return text('Reconnected to Zen Browser. Session: ' + bidi.sessionId);
     }
@@ -1080,8 +1007,12 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
+let inFlight = 0, idleTimer = null;
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  clearTimeout(idleTimer);
+  inFlight++;
   try {
     return await handleTool(name, args || {});
   } catch (error) {
@@ -1093,6 +1024,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }],
       isError: true,
     };
+  } finally {
+    if (--inFlight === 0)
+      idleTimer = setTimeout(() => {
+        log(`Idle ${IDLE_MS}ms: releasing Zen's BiDi session for other clients`);
+        bidi.disconnect().catch((e) => log('Idle release error (non-fatal):', e.message));
+      }, IDLE_MS);
   }
 });
 
