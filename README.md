@@ -135,6 +135,8 @@ zen-mcp speaks **WebDriver BiDi** (W3C standard) directly over WebSocket. Form f
 | Env Variable | Default | Description |
 |-------------|---------|-------------|
 | `ZEN_DEBUG_PORT` | `9222` | Zen's remote debugging port |
+| `ZEN_IDLE_MS` | `30000` | Release Zen's one BiDi session after this long without a tool call, so other clients can use Zen |
+| `ZEN_BUSY_WAIT_MS` | `20000` | How long a call waits while another client holds Zen before it errors |
 
 ## Requirements
 
@@ -145,6 +147,7 @@ zen-mcp speaks **WebDriver BiDi** (W3C standard) directly over WebSocket. Form f
 
 ```bash
 node test-e2e.mjs   # 21 tests, needs Zen running
+npm run test:idle   # two clients share Zen (fake BiDi server, no Zen needed)
 ```
 
 ## License
